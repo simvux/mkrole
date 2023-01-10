@@ -1,7 +1,9 @@
 use std::env;
 
+use futures::{StreamExt, TryStreamExt};
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
+use serenity::model::application::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
 use serenity::model::gateway::Ready;
 use serenity::model::guild::Member;
@@ -10,6 +12,28 @@ use serenity::model::id::{GuildId, RoleId, UserId};
 use serenity::prelude::*;
 
 struct Handler;
+
+async fn respond(command: &ApplicationCommandInteraction, ctx: &Context, text: &str) {
+    if let Err(err) = command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| message.content(text))
+        })
+        .await
+    {
+        eprintln!("unable to respond: {}", err);
+    }
+}
+
+async fn update_response(command: &ApplicationCommandInteraction, ctx: &Context, text: &str) {
+    if let Err(err) = command
+        .edit_original_interaction_response(&ctx.http, |message| message.content(text))
+        .await
+    {
+        eprintln!("unable to update response: {}", err);
+    }
+}
 
 #[async_trait]
 impl EventHandler for Handler {
@@ -30,6 +54,13 @@ impl EventHandler for Handler {
                     Characters::parse(text)
                 })
                 .unwrap_or_default();
+
+            if characters.0.len() > 5 {
+                respond(&command, &ctx, "Only a maximum of 5 characters is allowed").await;
+                return;
+            } else {
+                respond(&command, &ctx, "Loading...").await;
+            };
 
             let guild = match command.guild_id {
                 None => {
@@ -59,16 +90,7 @@ impl EventHandler for Handler {
                 "Roles successfully updated".to_string()
             };
 
-            if let Err(err) = command
-                .create_interaction_response(&ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(result))
-                })
-                .await
-            {
-                eprintln!("unable to respond: {}", err);
-            }
+            update_response(&command, &ctx, &result).await;
         }
     }
 
@@ -172,32 +194,32 @@ impl CharKind {
         }
     }
 
-    async fn clear(
-        &self,
-        ctx: &Context,
-        guild: &GuildId,
-        member: &mut Member,
-    ) -> serenity::Result<()> {
-        let members = guild.members(ctx, None, None).await?;
-        let roles = guild.roles(ctx).await?;
+    async fn clear(&self, ctx: &Context, guild: &GuildId, member: &Member) -> serenity::Result<()> {
+        let members_ref = &guild.members(ctx, None, None).await?;
+        let roles_ref = &guild.roles(ctx).await?;
 
-        for role_id in member.roles.clone() {
-            let role = roles
-                .get(&role_id)
-                .ok_or(serenity::Error::Other("corrupt role instance"))?;
+        futures::stream::iter(member.roles.clone().into_iter())
+            .map(Ok)
+            .try_for_each_concurrent(None, |role_id| async move {
+                let mut member = member.clone();
 
-            if is_character_role(role, self) {
-                println!("trying to remove role from user: {}", &role.name);
-                member.remove_role(ctx, role_id).await?;
+                let role = roles_ref
+                    .get(&role_id)
+                    .ok_or(serenity::Error::Other("corrupt role instance"))?;
 
-                if is_role_empty(&members, member.user.id, &role_id) {
-                    println!("trying to remove role from guild: {}", &role.name);
-                    guild.delete_role(ctx, role_id).await?;
+                if is_character_role(role, self) {
+                    println!("trying to remove role from user: {}", &role.name);
+                    member.remove_role(ctx, role_id).await?;
+
+                    if is_role_empty(members_ref, member.user.id, &role_id) {
+                        println!("trying to remove role from guild: {}", &role.name);
+                        guild.delete_role(ctx, role_id).await?;
+                    }
                 }
-            }
-        }
 
-        Ok(())
+                Result::<(), serenity::Error>::Ok(())
+            })
+            .await
     }
 
     async fn assign_characters(
